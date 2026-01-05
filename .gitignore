@@ -1,0 +1,8 @@
+cookies.txt
+users.txt
+*.log
+*.out
+key.pem
+cert.pem
+public/*
+!public/*.html
