@@ -4,5 +4,6 @@ users.txt
 *.out
 key.pem
 cert.pem
+file_transfer
 public/*
 !public/*.html

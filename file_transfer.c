@@ -154,7 +154,9 @@ fd_set wait_on_client(const fd_set *master, const int max_socket)
     if (select(max_socket + 1, &reads, 0, 0, 0) < 0)
     {
         fprintf(stderr, "select() failed. (%d)\n", errno);
-        exit(1);
+        FD_ZERO(&reads);
+
+        return reads;
     }
 
     return reads;
@@ -608,7 +610,7 @@ void print_http_request(const char *request)
     printf("----- HTTP Request End -----\n");
 }
 
-void handle_upload(struct client_info **client_list, struct client_info *client, const char *body, fd_set *master, int *max_socket, int server)
+void handle_upload(struct client_info **client_list, struct client_info *client, const char *body, fd_set *master, int *max_socket, int server, struct cookie *cookies)
 {
     char cookie_value[COOKIE_LEN + 1] = {0};
     if (!parse_cookie_header(client, cookie_value, COOKIE_LEN + 1))
@@ -618,7 +620,7 @@ void handle_upload(struct client_info **client_list, struct client_info *client,
         return;
     }
 
-    const char *username = verify_cookie(cookie_value, NULL);
+    char *username = verify_cookie(cookie_value, cookies);
     if (!username)
     {
         fprintf(stderr, "Invalid cookie.\n");
@@ -649,13 +651,71 @@ void handle_upload(struct client_info **client_list, struct client_info *client,
         return;
     }
 
-    const long length = client->remaining_bytes;
+    char *content_type = strstr(client->request, "Content-Type: multipart/form-data;");
 
-    long already_received = client->received - (long)(body - client->request);
-    if (already_received < 0)
-        already_received = 0;
-    if (already_received > length)
-        already_received = length;
+    if (!content_type)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    char *boundary_pos = strstr(content_type, "boundary=");
+    if (!boundary_pos)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    boundary_pos += strlen("boundary=");
+
+    char *boundary_end = strstr(boundary_pos, "\r\n");
+    if (!boundary_end)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    size_t boundary_len = boundary_end - boundary_pos;
+    char boundary[128];
+    snprintf(boundary, sizeof(boundary), "%.*s", (int)boundary_len, boundary_pos);
+    boundary[boundary_len + 1] = '\0';
+
+    char *file_name = strstr(body, "filename=\"");
+    if (!file_name)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+    file_name += strlen("filename=\"");
+    char *file_name_end = strchr(file_name, '"');
+    if (!file_name_end)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+    size_t file_name_len = file_name_end - file_name;
+    if (file_name_len == 0 || file_name_len >= 64)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    char filename_buffer[64];
+    snprintf(filename_buffer, sizeof(filename_buffer), "%.*s", (int)file_name_len, file_name);
+
+    if (strstr(filename_buffer, "..") || strchr(filename_buffer, '/') || strchr(filename_buffer, '\\'))
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    char *file_data_start = strstr(file_name_end, "\r\n\r\n");
+    if (!file_data_start)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+    file_data_start += 4;
 
     char directory[128];
     if (snprintf(directory, sizeof(directory), "public/%s/uploads", username) < 0)
@@ -670,31 +730,79 @@ void handle_upload(struct client_info **client_list, struct client_info *client,
         return;
     }
 
-    FILE *file = fopen(directory, "wb");
+    char filepath[256];
+    if (snprintf(filepath, sizeof(filepath), "%s/%s", directory, filename_buffer) < 0)
+    {
+        send_400(client_list, client, master, max_socket, server);
+        return;
+    }
+
+    FILE *file = fopen(filepath, "wb");
     if (!file)
     {
         send_400(client_list, client, master, max_socket, server);
         return;
     }
 
-    if (already_received > 0)
+    const long length = client->remaining_bytes;
+
+    long already_received = client->received - (long)(body - client->request);
+    if (already_received < 0)
+        already_received = 0;
+
+    long file_data_offset = file_data_start - body;
+    if (file_data_offset < 0)
+        file_data_offset = 0;
+
+    long file_in_body = already_received - file_data_offset;
+    if (file_in_body < 0)
+        file_in_body = 0;
+
+    if (file_in_body > 0)
     {
-        fwrite(body, 1, already_received, file);
+        fwrite(file_data_start, 1, file_in_body, file);
     }
 
-    long written = already_received;
+    long read = already_received;
+    long remaining = length - read;
     char buffer[4096];
 
-    while (written < length)
+    while (remaining > 0)
     {
-        
+        int len = remaining > sizeof(buffer) ? sizeof(buffer) : remaining;
+
+        int r = SSL_read(client->ssl, buffer, len);
+        if (r <= 0)
+        {
+            fclose(file);
+            send_400(client_list, client, master, max_socket, server);
+            return;
+        }
+
+        char end_boundary_check[256];
+        int check = snprintf(end_boundary_check, sizeof(end_boundary_check), "\r\n--%s--\r\n", boundary);
+        char *boundary_pos = strstr(buffer, end_boundary_check);
+        if (boundary_pos)
+        {
+            r = boundary_pos - buffer;
+            if (r == 0)
+            {
+                break;
+            }
+        }
+
+        fwrite(buffer, 1, r, file);
+        read += r;
+        remaining -= r;
     }
 
+    fclose(file);
+
     const char *response =
-        "HTTP/1.1 501 Not Implemented\r\n"
+        "HTTP/1.1 200 OK\r\n"
         "Connection: close\r\n"
-        "Content-Length: 15\r\n\r\n"
-        "Not Implemented";
+        "Content-Length: 17\r\n\r\n"
+        "Upload Successful";
     SSL_write(client->ssl, response, strlen(response));
 
     drop_client(client_list, client, master, max_socket, server);
@@ -823,6 +931,8 @@ int main()
                     client->received += byte_recevied;
                     client->request[client->received] = 0;
 
+                    head_end = strstr(client->request, "\r\n\r\n");
+
                     if (!head_end)
                     {
                         client = next;
@@ -844,7 +954,7 @@ int main()
                     }
                     else if (strncmp(client->request + 5, "/upload ", 8) == 0)
                     {
-                        handle_upload(&client_list, client, body, &master, &max_socket, server);
+                        handle_upload(&client_list, client, body, &master, &max_socket, server, cookies);
                     }
                     else
                     {
